@@ -1,0 +1,718 @@
+5G Network Slicing Simulator
+Original (OG) Source Code
+Complete source code extracted from the uploaded project file. The code is preserved as provided, without functional changes.
+Technology: React, Recharts, Lucide React, Tailwind CSS
+
+import React, { useState, useMemo, useCallback } from "react";
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  Cell,
+} from "recharts";
+import {
+  Wifi,
+  Cpu,
+  Timer,
+  Zap,
+  Download,
+  RotateCcw,
+  CheckCircle2,
+  XCircle,
+  AlertTriangle,
+  Radio,
+} from "lucide-react";
+ 
+/**
+ * ─────────────────────────────────────────────────────────────────────────
+ * 5G NETWORK SLICING — CONCEPT PRIMER (for the project report / viva)
+ * ─────────────────────────────────────────────────────────────────────────
+ * Network slicing lets a single physical 5G infrastructure (radio, transport,
+ * and core network) be partitioned into multiple independent *logical*
+ * networks — "slices" — each tuned to a different service's needs. This is
+ * done via Software Defined Networking (SDN) and Network Function
+ * Virtualization (NFV): the same base stations and switches run virtualized
+ * network functions, and an orchestrator carves out bandwidth, compute
+ * (for the virtualized functions), and latency guarantees per slice.
+ *
+ * The 3GPP defines three canonical service categories that this simulator
+ * models as slice types:
+ *   • eMBB  (Enhanced Mobile Broadband)          — throughput-first
+ *   • URLLC (Ultra-Reliable Low-Latency Comms)   — latency/reliability-first
+ *   • mMTC  (Massive Machine-Type Comms)         — density-first, tolerant
+ *
+ * A Service Level Agreement (SLA) per slice defines the guarantees the
+ * network must meet. In this simulator, an SLA "breach" occurs when either:
+ *   1) simulated traffic demand exceeds the bandwidth allocated to the slice
+ *      (congestion), or
+ *   2) simulated latency exceeds the slice's latency budget (jitter beyond
+ *      what the reserved scheduling priority can absorb).
+ *
+ * Note on "latency budget" as a pooled resource: in a real deployment,
+ * latency isn't literally drawn from a shared numeric pool the way
+ * bandwidth (Hz/Mbps) or compute (vCPU) is — it's an outcome of scheduling
+ * priority, transport hops, and RAN configuration. For teaching purposes,
+ * this simulator simplifies it into a shared 50ms "scheduling budget" pool
+ * so learners can see the fundamental trade-off: giving one slice tighter
+ * latency guarantees leaves less scheduling headroom for the others.
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+ 
+// ---------------------------------------------------------------------------
+// STATIC CONFIG — the physical resource pool and the three slice archetypes.
+// In a real orchestrator (e.g. a 5G Core's NSSMF) these would come from
+// infrastructure inventory and 3GPP-standard slice/service profiles.
+// ---------------------------------------------------------------------------
+ 
+const POOL_CAPACITY = { bandwidth: 1000, compute: 100, latency: 50 };
+ 
+const SLICE_CONFIG = {
+  embb: {
+    key: "embb",
+    name: "eMBB",
+    fullName: "Enhanced Mobile Broadband",
+    useCase: "Video streaming, AR/VR, high-speed browsing",
+    principle: "Prioritizes throughput. Tolerant of latency jitter.",
+    color: "blue",
+    latencyJitterMs: 9, // wider natural jitter — budget can be loose
+  },
+  urllc: {
+    key: "urllc",
+    name: "URLLC",
+    fullName: "Ultra-Reliable Low-Latency Communications",
+    useCase: "Autonomous vehicles, remote surgery, industrial control",
+    principle: "Prioritizes deterministic latency & reliability over throughput.",
+    color: "red",
+    latencyJitterMs: 1.4, // tiny jitter tolerance — needs a tight, guaranteed budget
+  },
+  mmtc: {
+    key: "mmtc",
+    name: "mMTC",
+    fullName: "Massive Machine-Type Communications",
+    useCase: "IoT sensors, smart meters, asset tracking",
+    principle: "Prioritizes connection density. Highly latency-tolerant.",
+    color: "emerald",
+    latencyJitterMs: 22, // very tolerant — sensors don't mind waiting
+  },
+};
+ 
+const SLICE_ORDER = ["embb", "urllc", "mmtc"];
+ 
+// Sensible starting allocation: leaves visible headroom in every pool so a
+// learner can immediately try pushing a slider into the "blocked" state.
+const DEFAULT_ALLOCATIONS = {
+  embb: { bandwidth: 500, compute: 40, latency: 15 },
+  urllc: { bandwidth: 100, compute: 30, latency: 1 },
+  mmtc: { bandwidth: 150, compute: 15, latency: 30 },
+};
+ 
+// Tailwind class lookups. Kept static (not template-interpolated with
+// arbitrary values) so every class the UI needs is a real, predefined
+// utility class.
+const COLOR_CLASSES = {
+  blue: {
+    text: "text-blue-400",
+    bg: "bg-blue-500",
+    bgSoft: "bg-blue-500/10",
+    border: "border-blue-500",
+    ring: "ring-blue-500",
+    fill: "#60a5fa",
+  },
+  red: {
+    text: "text-red-400",
+    bg: "bg-red-500",
+    bgSoft: "bg-red-500/10",
+    border: "border-red-500",
+    ring: "ring-red-500",
+    fill: "#f87171",
+  },
+  emerald: {
+    text: "text-emerald-400",
+    bg: "bg-emerald-500",
+    bgSoft: "bg-emerald-500/10",
+    border: "border-emerald-500",
+    ring: "ring-emerald-500",
+    fill: "#34d399",
+  },
+};
+ 
+const clamp = (val, min, max) => Math.min(Math.max(val, min), max);
+ 
+// ---------------------------------------------------------------------------
+// CUSTOM HOOK — encapsulates the "simulate traffic + check SLA" logic.
+// Kept separate from rendering so the simulation rules (the interesting
+// domain logic for a viva) are easy to point to in one place.
+// ---------------------------------------------------------------------------
+function useSliceSimulation() {
+  const [results, setResults] = useState(null);
+  const [runCount, setRunCount] = useState(0);
+ 
+  const simulate = useCallback((allocations, activeKeys, congestionMode) => {
+    // Congestion mode scales up demand generation to stress-test every
+    // active slice simultaneously — useful for demonstrating how an
+    // under-provisioned slice fails first under load.
+    const stress = congestionMode ? 1.7 : 1.0;
+ 
+    const next = {};
+    activeKeys.forEach((key) => {
+      const alloc = allocations[key];
+      const cfg = SLICE_CONFIG[key];
+ 
+      // Bandwidth demand: a random fraction of the allocation, occasionally
+      // spiking past 100% to simulate bursty real-world traffic.
+      const demandFactor = (0.35 + Math.random() * 1.0) * stress;
+      const bandwidthDemand = alloc.bandwidth * demandFactor;
+      const bandwidthUtilPct =
+        alloc.bandwidth > 0 ? (bandwidthDemand / alloc.bandwidth) * 100 : 0;
+ 
+      // Experienced latency: allocated budget plus random jitter. A slice
+      // with a tighter latencyJitterMs (like URLLC) swings less in absolute
+      // terms but has far less budget to absorb it.
+      const jitter = (Math.random() - 0.35) * cfg.latencyJitterMs * stress;
+      const experiencedLatency = Math.max(0.1, alloc.latency + jitter);
+ 
+      const bandwidthOk = bandwidthDemand <= alloc.bandwidth;
+      const latencyOk = experiencedLatency <= alloc.latency;
+ 
+      next[key] = {
+        bandwidthDemand,
+        bandwidthUtilPct,
+        experiencedLatency,
+        bandwidthOk,
+        latencyOk,
+        pass: bandwidthOk && latencyOk,
+      };
+    });
+ 
+    setResults(next);
+    setRunCount((c) => c + 1);
+    return next;
+  }, []);
+ 
+  const reset = useCallback(() => {
+    setResults(null);
+    setRunCount(0);
+  }, []);
+ 
+  return { results, runCount, simulate, reset };
+}
+ 
+// ---------------------------------------------------------------------------
+// PRESENTATIONAL PIECES
+// ---------------------------------------------------------------------------
+ 
+function PoolMeter({ icon: Icon, label, unit, total, used }) {
+  const pct = total > 0 ? clamp((used / total) * 100, 0, 100) : 0;
+  const isFull = used >= total;
+  return (
+    <div className="flex-1 min-w-[220px]">
+      <div className="flex items-center justify-between mb-1.5">
+        <div className="flex items-center gap-1.5 text-slate-300">
+          <Icon className="w-3.5 h-3.5" />
+          <span className="text-sm">{label}</span>
+        </div>
+        <span className="font-mono text-sm text-slate-400">
+          <span className={isFull ? "text-amber-400" : "text-slate-100"}>
+            {used.toFixed(0)}
+          </span>
+          {" / "}
+          {total}
+          <span className="text-slate-500"> {unit}</span>
+        </span>
+      </div>
+      <div className="h-2 rounded-sm bg-slate-800 overflow-hidden">
+        <div
+          className={`h-full rounded-sm transition-all duration-300 ${
+            isFull ? "bg-amber-500" : "bg-slate-400"
+          }`}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+ 
+function ResourceSlider({ label, value, max, step, unit, onChange, disabled, colorClasses }) {
+  return (
+    <div className="mb-3 last:mb-0">
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-xs text-slate-400">{label}</span>
+        <span className="font-mono text-xs text-slate-200">
+          {value.toFixed(step < 1 ? 1 : 0)} {unit}
+        </span>
+      </div>
+      <input
+        type="range"
+        min={0}
+        max={max}
+        step={step}
+        value={value}
+        disabled={disabled}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className={`w-full accent-current ${colorClasses.text} disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer`}
+      />
+    </div>
+  );
+}
+ 
+function SliceConfigCard({ cfg, allocation, active, remaining, onToggle, onChange, warning }) {
+  const c = COLOR_CLASSES[cfg.color];
+  return (
+    <div
+      className={`border-l-2 ${active ? c.border : "border-slate-700"} bg-slate-900 rounded-sm p-4 transition-colors`}
+    >
+      <div className="flex items-start justify-between mb-1">
+        <div>
+          <div className="flex items-center gap-2">
+            <span className={`font-mono text-sm font-semibold ${c.text}`}>{cfg.name}</span>
+            <span className="text-xs text-slate-500">{cfg.fullName}</span>
+          </div>
+          <p className="text-xs text-slate-500 mt-0.5">{cfg.useCase}</p>
+        </div>
+        <label className="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={active}
+            onChange={() => onToggle(cfg.key)}
+            className="accent-slate-400"
+          />
+          active
+        </label>
+      </div>
+ 
+      <p className="text-xs text-slate-600 italic mb-3">{cfg.principle}</p>
+ 
+      <ResourceSlider
+        label="Bandwidth"
+        value={allocation.bandwidth}
+        max={clamp(allocation.bandwidth + remaining.bandwidth, 0, POOL_CAPACITY.bandwidth)}
+        step={5}
+        unit="Mbps"
+        onChange={(v) => onChange(cfg.key, "bandwidth", v)}
+        disabled={!active}
+        colorClasses={c}
+      />
+      <ResourceSlider
+        label="Compute"
+        value={allocation.compute}
+        max={clamp(allocation.compute + remaining.compute, 0, POOL_CAPACITY.compute)}
+        step={1}
+        unit="units"
+        onChange={(v) => onChange(cfg.key, "compute", v)}
+        disabled={!active}
+        colorClasses={c}
+      />
+      <ResourceSlider
+        label="Latency budget"
+        value={allocation.latency}
+        max={clamp(allocation.latency + remaining.latency, 0, POOL_CAPACITY.latency)}
+        step={0.5}
+        unit="ms"
+        onChange={(v) => onChange(cfg.key, "latency", v)}
+        disabled={!active}
+        colorClasses={c}
+      />
+ 
+      {warning && (
+        <div className="flex items-center gap-1.5 mt-2 text-xs text-amber-400">
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+          <span>{warning}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+ 
+function ResourceChart({ allocations, activeKeys }) {
+  // Normalize both resources to "% of pool" so bandwidth (0–1000) and
+  // compute (0–100) can share one Y axis meaningfully.
+  const data = ["Bandwidth", "Compute"].map((resource) => {
+    const row = { resource };
+    SLICE_ORDER.forEach((key) => {
+      if (!activeKeys.includes(key)) {
+        row[key] = 0;
+        return;
+      }
+      const total = resource === "Bandwidth" ? POOL_CAPACITY.bandwidth : POOL_CAPACITY.compute;
+      const used = resource === "Bandwidth" ? allocations[key].bandwidth : allocations[key].compute;
+      row[key] = total > 0 ? (used / total) * 100 : 0;
+    });
+    return row;
+  });
+ 
+  return (
+    <ResponsiveContainer width="100%" height={220}>
+      <BarChart data={data} margin={{ top: 8, right: 8, left: -12, bottom: 0 }}>
+        <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
+        <XAxis dataKey="resource" stroke="#64748b" fontSize={12} tickLine={false} />
+        <YAxis
+          stroke="#64748b"
+          fontSize={11}
+          tickLine={false}
+          domain={[0, 100]}
+          tickFormatter={(v) => `${v}%`}
+          width={40}
+        />
+        <Tooltip
+          formatter={(value, name) => [`${value.toFixed(1)}%`, SLICE_CONFIG[name].name]}
+          contentStyle={{
+            background: "#0f172a",
+            border: "1px solid #334155",
+            borderRadius: 4,
+            fontSize: 12,
+          }}
+          labelStyle={{ color: "#e2e8f0" }}
+        />
+        {SLICE_ORDER.map((key) => (
+          <Bar key={key} dataKey={key} stackId="pool" fill={COLOR_CLASSES[SLICE_CONFIG[key].color].fill}>
+            {data.map((_, i) => (
+              <Cell key={i} />
+            ))}
+          </Bar>
+        ))}
+      </BarChart>
+    </ResponsiveContainer>
+  );
+}
+ 
+function SlaBadge({ pass, label }) {
+  return (
+    <span
+      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[11px] font-mono ${
+        pass ? "bg-emerald-500/15 text-emerald-400" : "bg-red-500/15 text-red-400"
+      }`}
+    >
+      {pass ? <CheckCircle2 className="w-3 h-3" /> : <XCircle className="w-3 h-3" />}
+      {label}
+    </span>
+  );
+}
+ 
+function SliceCard({ cfg, allocation, active, simResult }) {
+  const c = COLOR_CLASSES[cfg.color];
+  if (!active) {
+    return (
+      <div className="border-l-2 border-slate-800 bg-slate-900/40 rounded-sm p-4 opacity-50">
+        <span className="font-mono text-sm text-slate-500">{cfg.name}</span>
+        <p className="text-xs text-slate-600 mt-1">Slice inactive — not receiving resources.</p>
+      </div>
+    );
+  }
+ 
+  return (
+    <div className={`border-l-2 ${c.border} bg-slate-900 rounded-sm p-4`}>
+      <div className="flex items-center justify-between mb-3">
+        <span className={`font-mono text-sm font-semibold ${c.text}`}>{cfg.name}</span>
+        {simResult ? (
+          <SlaBadge pass={simResult.pass} label={simResult.pass ? "SLA PASS" : "SLA FAIL"} />
+        ) : (
+          <span className="text-[11px] text-slate-600 font-mono">not run</span>
+        )}
+      </div>
+ 
+      <div className="space-y-1.5 text-xs font-mono">
+        <div className="flex justify-between text-slate-400">
+          <span>bandwidth alloc</span>
+          <span className="text-slate-200">{allocation.bandwidth} Mbps</span>
+        </div>
+        <div className="flex justify-between text-slate-400">
+          <span>compute alloc</span>
+          <span className="text-slate-200">{allocation.compute} units</span>
+        </div>
+        <div className="flex justify-between text-slate-400">
+          <span>latency budget</span>
+          <span className="text-slate-200">{allocation.latency.toFixed(1)} ms</span>
+        </div>
+      </div>
+ 
+      {simResult && (
+        <div className="mt-3 pt-3 border-t border-slate-800 space-y-2">
+          <div>
+            <div className="flex justify-between text-[11px] font-mono mb-1">
+              <span className={simResult.bandwidthOk ? "text-slate-400" : "text-red-400"}>
+                load: {simResult.bandwidthUtilPct.toFixed(0)}% of allocation
+              </span>
+            </div>
+            <div className="h-1.5 rounded-sm bg-slate-800 overflow-hidden">
+              <div
+                className={`h-full ${simResult.bandwidthOk ? c.bg : "bg-red-500"}`}
+                style={{ width: `${clamp(simResult.bandwidthUtilPct, 0, 100)}%` }}
+              />
+            </div>
+          </div>
+          <div className="flex justify-between text-[11px] font-mono">
+            <span className={simResult.latencyOk ? "text-slate-400" : "text-red-400"}>
+              latency: {simResult.experiencedLatency.toFixed(1)}ms / {allocation.latency.toFixed(1)}ms budget
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+ 
+// ---------------------------------------------------------------------------
+// APP — top-level state lives here: allocations, which slices are active,
+// congestion mode, and (via the hook) the last simulation results.
+// ---------------------------------------------------------------------------
+export default function App() {
+  const [allocations, setAllocations] = useState(DEFAULT_ALLOCATIONS);
+  const [activeKeys, setActiveKeys] = useState(SLICE_ORDER); // all 3 active by default
+  const [congestionMode, setCongestionMode] = useState(false);
+  const [warnings, setWarnings] = useState({});
+  const { results, runCount, simulate, reset } = useSliceSimulation();
+ 
+  // Note on persistence: a production build of this simulator would persist
+  // `allocations` to localStorage so a page refresh keeps your configuration.
+  // Browser storage APIs aren't available in this preview environment, so
+  // configuration lives in React state for the session instead.
+ 
+  const totals = useMemo(() => {
+    const t = { bandwidth: 0, compute: 0, latency: 0 };
+    activeKeys.forEach((key) => {
+      t.bandwidth += allocations[key].bandwidth;
+      t.compute += allocations[key].compute;
+      t.latency += allocations[key].latency;
+    });
+    return t;
+  }, [allocations, activeKeys]);
+ 
+  const remainingFor = useCallback(
+    (sliceKey) => {
+      // Headroom in the pool if you excluded this slice's own current use —
+      // i.e. how much MORE this slice could take right now.
+      const other = { bandwidth: 0, compute: 0, latency: 0 };
+      activeKeys.forEach((key) => {
+        if (key === sliceKey) return;
+        other.bandwidth += allocations[key].bandwidth;
+        other.compute += allocations[key].compute;
+        other.latency += allocations[key].latency;
+      });
+      return {
+        bandwidth: POOL_CAPACITY.bandwidth - other.bandwidth - allocations[sliceKey].bandwidth,
+        compute: POOL_CAPACITY.compute - other.compute - allocations[sliceKey].compute,
+        latency: POOL_CAPACITY.latency - other.latency - allocations[sliceKey].latency,
+      };
+    },
+    [allocations, activeKeys]
+  );
+ 
+  const handleAllocationChange = useCallback(
+    (sliceKey, resource, requestedValue) => {
+      const otherSum = activeKeys.reduce((sum, key) => {
+        if (key === sliceKey) return sum;
+        return sum + allocations[key][resource];
+      }, 0);
+      const poolTotal = POOL_CAPACITY[resource];
+      const maxAllowed = poolTotal - otherSum;
+      const clamped = clamp(requestedValue, 0, maxAllowed);
+ 
+      setAllocations((prev) => ({
+        ...prev,
+        [sliceKey]: { ...prev[sliceKey], [resource]: clamped },
+      }));
+ 
+      // Inline warning when the user tried to exceed the pool.
+      setWarnings((prev) => {
+        const next = { ...prev };
+        const warnKey = `${sliceKey}`;
+        if (requestedValue > maxAllowed) {
+          next[warnKey] = `${resource[0].toUpperCase()}${resource.slice(1)} capped at pool limit — no headroom left.`;
+        } else {
+          delete next[warnKey];
+        }
+        return next;
+      });
+    },
+    [allocations, activeKeys]
+  );
+ 
+  const handleToggleActive = useCallback((sliceKey) => {
+    setActiveKeys((prev) =>
+      prev.includes(sliceKey) ? prev.filter((k) => k !== sliceKey) : [...prev, sliceKey]
+    );
+  }, []);
+ 
+  const handleSimulate = () => {
+    simulate(allocations, activeKeys, congestionMode);
+  };
+ 
+  const handleResetAllocations = () => {
+    setAllocations(DEFAULT_ALLOCATIONS);
+    setActiveKeys(SLICE_ORDER);
+    setWarnings({});
+    reset();
+  };
+ 
+  const handleExport = () => {
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      poolCapacity: POOL_CAPACITY,
+      allocations,
+      activeSlices: activeKeys,
+      congestionMode,
+      lastSimulationResults: results,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "network-slicing-config.json";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+ 
+  const overallUtilization =
+    ((totals.bandwidth / POOL_CAPACITY.bandwidth + totals.compute / POOL_CAPACITY.compute) / 2) * 100;
+ 
+  const passCount = results ? Object.values(results).filter((r) => r.pass).length : 0;
+ 
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-200 font-sans">
+      <div className="max-w-6xl mx-auto px-5 py-8">
+        {/* ── Header ───────────────────────────────────────────────── */}
+        <header className="flex flex-col md:flex-row md:items-end md:justify-between gap-4 mb-8">
+          <div>
+            <div className="flex items-center gap-2 text-slate-500 text-xs font-mono mb-2">
+              <Radio className="w-3.5 h-3.5" />
+              <span>RAN + Core orchestration preview</span>
+            </div>
+            <h1 className="text-2xl font-semibold text-slate-50 leading-tight">
+              5G network slicing simulator
+            </h1>
+            <p className="text-sm text-slate-500 mt-1 max-w-xl">
+              One physical network, three virtual slices. Adjust how bandwidth, compute, and
+              latency budget are carved up, then simulate live traffic to see which slices hold
+              their SLA.
+            </p>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={handleResetAllocations}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-sm border border-slate-700 text-slate-400 text-sm hover:border-slate-500 hover:text-slate-200 transition-colors"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              Reset
+            </button>
+            <button
+              onClick={handleExport}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-sm border border-slate-700 text-slate-400 text-sm hover:border-slate-500 hover:text-slate-200 transition-colors"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Export JSON
+            </button>
+            <button
+              onClick={handleSimulate}
+              className="flex items-center gap-1.5 px-4 py-2 rounded-sm bg-amber-500 text-slate-950 text-sm font-medium hover:bg-amber-400 transition-colors"
+            >
+              <Zap className="w-3.5 h-3.5" />
+              Simulate traffic
+            </button>
+          </div>
+        </header>
+ 
+        {/* ── Resource pool summary ───────────────────────────────── */}
+        <section className="bg-slate-900/60 border border-slate-800 rounded-sm p-5 mb-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-sm text-slate-300">Physical resource pool</h2>
+            <div className="flex items-center gap-4">
+              <label className="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={congestionMode}
+                  onChange={() => setCongestionMode((v) => !v)}
+                  className="accent-amber-500"
+                />
+                Congestion mode (stress-test all slices)
+              </label>
+              <span className="font-mono text-xs text-slate-500">
+                network utilization{" "}
+                <span className="text-amber-400 text-sm">{overallUtilization.toFixed(0)}%</span>
+              </span>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-6">
+            <PoolMeter icon={Wifi} label="Bandwidth" unit="Mbps" total={POOL_CAPACITY.bandwidth} used={totals.bandwidth} />
+            <PoolMeter icon={Cpu} label="Compute" unit="units" total={POOL_CAPACITY.compute} used={totals.compute} />
+            <PoolMeter icon={Timer} label="Latency budget" unit="ms" total={POOL_CAPACITY.latency} used={totals.latency} />
+          </div>
+        </section>
+ 
+        {/* ── Configuration + chart ───────────────────────────────── */}
+        <section className="grid grid-cols-1 lg:grid-cols-5 gap-5 mb-6">
+          <div className="lg:col-span-3 space-y-3">
+            <h2 className="text-sm text-slate-300 mb-1">Slice configuration</h2>
+            {SLICE_ORDER.map((key) => (
+              <SliceConfigCard
+                key={key}
+                cfg={SLICE_CONFIG[key]}
+                allocation={allocations[key]}
+                active={activeKeys.includes(key)}
+                remaining={remainingFor(key)}
+                onToggle={handleToggleActive}
+                onChange={handleAllocationChange}
+                warning={warnings[key]}
+              />
+            ))}
+          </div>
+ 
+          <div className="lg:col-span-2">
+            <h2 className="text-sm text-slate-300 mb-1">Allocation split</h2>
+            <div className="bg-slate-900/60 border border-slate-800 rounded-sm p-4">
+              <ResourceChart allocations={allocations} activeKeys={activeKeys} />
+              <div className="flex items-center justify-center gap-4 mt-1">
+                {SLICE_ORDER.map((key) => {
+                  const c = COLOR_CLASSES[SLICE_CONFIG[key].color];
+                  return (
+                    <div key={key} className="flex items-center gap-1.5 text-xs text-slate-400">
+                      <span className={`w-2 h-2 rounded-full ${c.bg}`} />
+                      {SLICE_CONFIG[key].name}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+ 
+            {results && (
+              <div className="mt-3 bg-slate-900/60 border border-slate-800 rounded-sm p-4">
+                <div className="flex items-center justify-between text-xs font-mono">
+                  <span className="text-slate-400">last simulation (run #{runCount})</span>
+                  <span className={passCount === activeKeys.length ? "text-emerald-400" : "text-amber-400"}>
+                    {passCount} / {activeKeys.length} slices within SLA
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+        </section>
+ 
+        {/* ── Slice status dashboard ─────────────────────────────── */}
+        <section>
+          <h2 className="text-sm text-slate-300 mb-3">Slice status</h2>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {SLICE_ORDER.map((key) => (
+              <SliceCard
+                key={key}
+                cfg={SLICE_CONFIG[key]}
+                allocation={allocations[key]}
+                active={activeKeys.includes(key)}
+                simResult={results ? results[key] : null}
+              />
+            ))}
+          </div>
+        </section>
+ 
+        <footer className="mt-10 pt-4 border-t border-slate-800 text-xs text-slate-600">
+          Simulated environment for demonstration only — random traffic is generated with{" "}
+          <code className="font-mono">Math.random()</code>, not real network telemetry.
+        </footer>
+      </div>
+    </div>
+  );
+}
